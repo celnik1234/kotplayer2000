@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <title>Kot Player 2000 — Naprawiona wersja</title>
+  <style>
+    body { background: #000; color: #fff; font-family: monospace; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; gap:10px; }
+    #cat { width:200px; }
+    .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:center; }
+    input[type="range"] { width:220px; }
+    button, a.button { background:#1e90ff; color:#000; padding:8px 12px; border-radius:6px; text-decoration:none; border:none; cursor:pointer; font-weight:700; }
+    button[disabled], a.button.disabled { opacity:0.4; cursor:default; }
+    #status { font-size:12px; color:#ccc; height:18px; }
+    #timer { font-weight:700; }
+  </style>
+</head>
+<body>
+  <img id="cat" src="https://media.giphy.com/media/JIX9t2j0ZTN9S/giphy.gif" alt="kot">
+  <h2>Kot Player 2000</h2>
+
+  <div class="controls">
+    <input type="file" id="fileInput" accept="audio/*">
+    <label>Retro:</label>
+    <input type="range" id="intensity" min="0" max="100" value="50">
+    <button id="playPauseBtn" disabled>Play</button>
+    <button id="downloadBtn" class="disabled" disabled>Pobierz retro audio</button>
+    <!-- hidden anchor used to trigger synchronous download -->
+    <a id="downloadAnchor" style="display:none;"></a>
+  </div>
+
+  <input type="range" id="progress" min="0" max="100" value="0" style="width:320px;">
+  <div id="timer">00:00 / 00:00</div>
+  <div id="status"></div>
+
+<script>
+(async () => {
+  const fileInput = document.getElementById('fileInput');
+  const intensity = document.getElementById('intensity');
+  const playPauseBtn = document.getElementById('playPauseBtn');
+  const downloadBtn = document.getElementById('downloadBtn');
+  const downloadAnchor = document.getElementById('downloadAnchor');
+  const progress = document.getElementById('progress');
+  const timer = document.getElementById('timer');
+  const status = document.getElementById('status');
+
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const OfflineCtor = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const audioCtx = new AudioCtx();
+
+  let originalBuffer = null;
+  let currentSource = null;
+  let startTime = 0;
+  let pauseOffset = 0;
+  let isPlaying = false;
+  let downloadUrl = null;     // objectURL do gotowego (.wav)
+  let renderingPromise = null;
+  let intensityDebounceTimer = null;
+
+  function logStatus(s) {
+    status.textContent = s;
+    console.log('[KotPlayer]', s);
+  }
+
+  function createBitcrusher(context, val) {
+    const bitcrusher = context.createWaveShaper();
+    const curve = new Float32Array(256);
+    const strength = val / 100;
+    for (let i = 0; i < 256; i++) {
+      curve[i] = (i < 128 ? -strength : strength);
+    }
+    bitcrusher.curve = curve;
+    bitcrusher.oversample = "2x";
+    return bitcrusher;
+  }
+
+  async function processAudio(buffer, val) {
+    if (!OfflineCtor) throw new Error('OfflineAudioContext nieobsługiwany w tej przeglądarce.');
+    const offlineCtx = new OfflineCtor(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
+    const src = offlineCtx.createBufferSource();
+    src.buffer = buffer;
+
+    const bc = createBitcrusher(offlineCtx, val);
+    const filter = offlineCtx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = 4000 + (1 - val / 100) * 4000;
+
+    src.connect(bc).connect(filter).connect(offlineCtx.destination);
+    src.start(0);
+
+    return offlineCtx.startRendering(); // AudioBuffer
+  }
+
+  // konwersja AudioBuffer -> WAV (ArrayBuffer)
+  function audioBufferToWav(buffer) {
+    const numOfChan = buffer.numberOfChannels;
+    const length = buffer.length * numOfChan * 2 + 44;
+    const arrayBuffer = new ArrayBuffer(length);
+    const view = new DataView(arrayBuffer);
+    let offset = 0;
+    function setUint16(data) { view.setUint16(offset, data, true); offset += 2; }
+    function setUint32(data) { view.setUint32(offset, data, true); offset += 4; }
+
+    setUint32(0x46464952); // "RIFF"
+    setUint32(length - 8);
+    setUint32(0x45564157); // "WAVE"
+
+    setUint32(0x20746d66); // "fmt "
+    setUint32(16);
+    setUint16(1);
+    setUint16(numOfChan);
+    setUint32(buffer.sampleRate);
+    setUint32(buffer.sampleRate * 2 * numOfChan);
+    setUint16(numOfChan * 2);
+    setUint16(16);
+
+    setUint32(0x61746164); // "data"
+    setUint32(length - offset - 4);
+
+    const channels = [];
+    for (let i = 0; i < numOfChan; i++) channels.push(buffer.getChannelData(i));
+
+    let pos = 44;
+    for (let i = 0; i < buffer.length; i++) {
+      for (let ch = 0; ch < numOfChan; ch++) {
+        let sample = Math.max(-1, Math.min(1, channels[ch][i]));
+        view.setInt16(pos, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+        pos += 2;
+      }
+    }
+    return arrayBuffer;
+  }
+
+  function startPlaybackAt(seek = 0) {
+    if (!originalBuffer) return;
+    if (currentSource) {
+      try { currentSource.onended = null; currentSource.stop(); } catch (e) {}
+    }
+    const src = audioCtx.createBufferSource();
+    src.buffer = originalBuffer;
+    const bc = createBitcrusher(audioCtx, Number(intensity.value));
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = 4000 + (1 - Number(intensity.value)/100) * 4000;
+    src.connect(bc).connect(filter).connect(audioCtx.destination);
+
+    startTime = audioCtx.currentTime - seek;
+    src.start(0, seek);
+    currentSource = src;
+    isPlaying = true;
+    src.onended = () => { isPlaying = false; updateTimerUI(); };
+
+    // ensure audioCtx is resumed (required in some browsers)
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    updateTimerUI();
+  }
+
+  function pausePlayback() {
+    if (currentSource) {
+      try {
+        currentSource.onended = null;
+        currentSource.stop();
+      } catch (e) {}
+    }
+    pauseOffset = audioCtx.currentTime - startTime;
+    isPlaying = false;
+  }
+
+  function formatTime(t) {
+    if (!isFinite(t) || t < 0) t = 0;
+    const m = Math.floor(t / 60).toString().padStart(2,'0');
+    const s = Math.floor(t % 60).toString().padStart(2,'0');
+    return `${m}:${s}`;
+  }
+
+  function updateTimerUI() {
+    if (!originalBuffer) {
+      timer.textContent = '00:00 / 00:00';
+      progress.value = 0;
+      return;
+    }
+    const duration = originalBuffer.duration;
+    if (isPlaying) {
+      const current = audioCtx.currentTime - startTime;
+      progress.value = Math.min(100, (current / duration) * 100);
+      timer.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
+      requestAnimationFrame(updateTimerUI);
+    } else {
+      const current = pauseOffset;
+      progress.value = Math.min(100, (current / duration) * 100);
+      timer.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
+    }
+  }
+
+  async function prepareDownloadBlob(buffer, val) {
+    try {
+      logStatus('Renderowanie gotowego pliku...');
+      if (downloadUrl) { URL.revokeObjectURL(downloadUrl); downloadUrl = null; }
+      // render offline (może chwilę potrwać)
+      const rendered = await processAudio(buffer, val);
+      const wavArrBuf = audioBufferToWav(rendered);
+      const blob = new Blob([new Uint8Array(wavArrBuf)], { type: 'audio/wav' });
+      downloadUrl = URL.createObjectURL(blob);
+      downloadAnchor.href = downloadUrl;
+      downloadAnchor.download = 'retro_audio.wav';
+      downloadBtn.classList.remove('disabled');
+      downloadBtn.disabled = false;
+      logStatus('Gotowe — kliknij Pobierz.');
+      console.log('[KotPlayer] downloadUrl prepared');
+    } catch (err) {
+      console.error('Render error:', err);
+      logStatus('Błąd renderowania: ' + (err.message || err));
+      downloadBtn.disabled = true;
+      downloadBtn.classList.add('disabled');
+    }
+  }
+
+  // plik wczytany
+  fileInput.addEventListener('change', async (ev) => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    logStatus('Ładowanie pliku...');
+    try {
+      const ab = await f.arrayBuffer();
+      // decodeAudioData zwraca promise w nowoczesnych przeglądarkach
+      originalBuffer = await audioCtx.decodeAudioData(ab.slice(0));
+      pauseOffset = 0;
+      startPlaybackAt(0);
+      playPauseBtn.disabled = false;
+      playPauseBtn.textContent = 'Pause';
+      // przygotuj downloaden synchronnie (asynchronicznie, ale przed włączeniem guzika)
+      downloadBtn.disabled = true;
+      downloadBtn.classList.add('disabled');
+      status.textContent = 'Renderowanie...';
+      // zapamiętaj promise (możemy go anulować logicznie przy nowym wczytaniu)
+      renderingPromise = prepareDownloadBlob(originalBuffer, Number(intensity.value));
+      await renderingPromise; // wait until blob ready before allowing user to click
+    } catch (err) {
+      console.error(err);
+      logStatus('Błąd wczytywania pliku: ' + (err.message || err));
+    }
+  });
+
+  // play/pause
+  playPauseBtn.addEventListener('click', () => {
+    if (!originalBuffer) return;
+    if (isPlaying) {
+      pausePlayback();
+      playPauseBtn.textContent = 'Play';
+    } else {
+      startPlaybackAt(pauseOffset);
+      playPauseBtn.textContent = 'Pause';
+    }
+  });
+
+  // progress seek
+  let isSeeking = false;
+  progress.addEventListener('input', (e) => {
+    if (!originalBuffer) return;
+    isSeeking = true;
+    const t = (progress.value / 100) * originalBuffer.duration;
+    timer.textContent = `${formatTime(t)} / ${formatTime(originalBuffer.duration)}`;
+  });
+  progress.addEventListener('change', (e) => {
+    if (!originalBuffer) return;
+    const t = (progress.value / 100) * originalBuffer.duration;
+    pauseOffset = t;
+    if (isPlaying) startPlaybackAt(t);
+    else updateTimerUI();
+    isSeeking = false;
+  });
+
+  // intensity slider: aktualizuje live i przygotowuje nowy plik (z debounce)
+  intensity.addEventListener('input', () => {
+    if (!originalBuffer) return;
+    // update live immediately
+    const currentSeek = isPlaying ? (audioCtx.currentTime - startTime) : pauseOffset;
+    startPlaybackAt(currentSeek);
+
+    // debounce offline render (żeby nie renderować na każdym piknięciu)
+    if (intensityDebounceTimer) clearTimeout(intensityDebounceTimer);
+    intensityDebounceTimer = setTimeout(async () => {
+      if (!originalBuffer) return;
+      downloadBtn.disabled = true;
+      downloadBtn.classList.add('disabled');
+      renderingPromise = prepareDownloadBlob(originalBuffer, Number(intensity.value));
+      await renderingPromise;
+    }, 400);
+  });
+
+  // download: synchronne kliknięcie hidden anchor (musi być bez await)
+  downloadBtn.addEventListener('click', () => {
+    if (downloadUrl) {
+      // synchronous click -> powinno działać we wszystkich przeglądarkach
+      downloadAnchor.click();
+    } else {
+      logStatus('Plik jeszcze nie przygotowany.');
+    }
+  });
+
+  // initial UI
+  logStatus('Gotowe. Wczytaj plik audio.');
+})();
+</script>
+</body>
+</html>
